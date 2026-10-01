@@ -21,12 +21,24 @@ python3 app.py
 - `POST /api/incidents`：创建遇险事件并识别重复报警
 - `POST /api/assets`：登记资源
 - `POST /api/areas`：创建搜索区域
+- `POST /api/areas/split`：把搜索区域按方位角拆成连续扇区（同一区域只能拆一次）
 - `POST /api/assignments`：按能力、海况和航程分配资源
+- `POST /api/areas/reassign`：改派区域（`expected_area_version` 乐观锁，并发改派只有一人成功）
+- `POST /api/sectors/coverage`：上报扇区覆盖，按 `client_event_id` 去重；海况或航程不合格只进待核清单，不改变覆盖范围
+- `GET /api/reviews?status=pending|resolved|all`：待核清单
+- `POST /api/reviews/resolve`：复核待核项（`confirmed` 采纳覆盖 / `rejected` 驳回）
 - `POST /api/clues`、`POST /api/clues/verify`
 - `POST /api/assets/withdraw`：撤回资源并释放任务
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`
-- `POST /api/offline/batch`：幂等合并离线记录
+- `POST /api/offline/batch`：幂等合并离线记录；支持 `sector_coverage` 事件，批次恢复后重算已结束区域覆盖，冲突项进待核清单，重放批次不生成重复扇区/覆盖记录
 - `GET /api/incidents/{id}/timeline`
+
+## 扇区与失联恢复
+
+- 搜索区域拆成按方位角等分的连续扇区（`AREA-xx-S01…`），`sectors.status` 为 `pending`（待补扫）或 `covered`（已覆盖）。
+- 覆盖上报携带客户端幂等编号；重复编号返回原记录，不重复计数。
+- 海况超出资源能力或扇区超出资源航程时，上报只写待核清单（`coverage_unqualified`），扇区仍为待补扫；协调员/分析师复核后可采纳或驳回。
+- 区域已结束才到达的覆盖（含离线恢复批次）产生 `ended_area_coverage` 待核项，系统同时重算该区域覆盖率，冲突留待人工复核。
 
 ## 测试
 
