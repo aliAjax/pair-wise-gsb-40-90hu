@@ -21,11 +21,18 @@ python3 app.py
 - `POST /api/incidents`：创建遇险事件并识别重复报警
 - `POST /api/assets`：登记资源
 - `POST /api/areas`：创建搜索区域
+- `POST /api/areas/split`：把区域拆成首尾相接的连续扇区（重复拆分幂等，数量变化返回 409）
+- `GET /api/areas/{id}/sectors`：列出区域扇区
+- `POST /api/coverage`：资源上报扇区覆盖，按 `client_report_id` 去重；海况/航程不合格只进待核清单，不改变覆盖
+- `POST /api/sectors/reassign`：扇区改派（乐观版本控制，并发改派只有一人成功）
+- `GET /api/coverage/reviews`：待核/复核清单
+- `POST /api/coverage/review`：协调员批准/驳回待核项；区域已结束时批准保留为冲突终态
 - `POST /api/assignments`：按能力、海况和航程分配资源
 - `POST /api/clues`、`POST /api/clues/verify`
-- `POST /api/assets/withdraw`：撤回资源并释放任务
+- `POST /api/assets/withdraw`：撤回资源并释放任务（含扇区任务）
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`
-- `POST /api/offline/batch`：幂等合并离线记录
+- `POST /api/offline/batch`：幂等合并离线记录，支持 `clue`、`timeline`、`sector_split`、`coverage` 事件；
+  合并后重算涉及区域的覆盖，已结束区域的差异生成冲突项留待复核，批次/上报重放均不产生重复扇区或覆盖记录
 - `GET /api/incidents/{id}/timeline`
 
 ## 测试
@@ -34,7 +41,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整协调流程、重复报警、错误位置、资源并发占用、离线幂等和权限拒绝。
+测试覆盖完整协调流程、重复报警、错误位置、资源并发占用、离线幂等、权限拒绝、连续扇区拆分、覆盖去重、待核清单、并发改派和离线恢复冲突复核。
 
 ## 局限
 

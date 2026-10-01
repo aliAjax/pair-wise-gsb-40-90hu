@@ -1,8 +1,22 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}.tag{padding:1px 8px;border-radius:10px;font-size:12px}.pending{background:#fff3cd}.assigned{background:#cfe8ff}.covered{background:#d4edda}.ineligible,.conflict{background:#f8d7da}.approved{background:#d4edda}.rejected{background:#e2e3e5}</style>
 <h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
 <h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th><th>最大海况</th></tr></thead><tbody></tbody></table>
+<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th><th>扇区覆盖</th></tr></thead><tbody></tbody></table>
+<h2>扇区</h2><table id="sectors"><thead><tr><th>区域</th><th>序号</th><th>方位角</th><th>状态</th><th>资源</th><th>覆盖时间</th></tr></thead><tbody></tbody></table>
+<h2>待核清单</h2><table id="reviews"><thead><tr><th>ID</th><th>区域</th><th>扇区</th><th>类型</th><th>原因</th><th>状态</th><th>上报人</th></tr></thead><tbody></tbody></table>
 <h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km','max_sea_state']);
+  document.querySelector('#areas tbody').innerHTML=d.search_areas.map(r=>`<tr><td>${r.code}</td><td>${r.incident_id}</td><td><span class="tag ${r.status}">${r.status}</span></td><td>${r.priority}</td><td>${r.assigned_asset_id??''}</td><td>${r.covered_sector_count}/${r.sector_count}</td></tr>`).join('');
+  document.querySelector('#sectors tbody').innerHTML=d.sectors.map(r=>`<tr><td>${r.area_id}</td><td>${r.seq}</td><td>${r.bearing_start}°–${r.bearing_end}°</td><td><span class="tag ${r.status}">${r.status}</span></td><td>${r.assigned_asset_id??''}</td><td>${r.covered_at??''}</td></tr>`).join('');
+  document.querySelector('#reviews tbody').innerHTML=d.coverage_reviews.map(r=>`<tr><td>${r.id}</td><td>${r.area_id}</td><td>${r.sector_id}</td><td>${r.kind}</td><td>${r.reason}</td><td><span class="tag ${r.status}">${r.status}</span></td><td>${r.reporter}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+}
+load();setInterval(load,5000);
+</script></html>

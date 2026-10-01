@@ -37,6 +37,18 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(math.sqrt(a))
 
 
+def destination_point(lat: float, lon: float, bearing: float, distance_km: float) -> tuple[float, float]:
+    """Great-circle destination at given bearing/distance, matching haversine_km's radius."""
+    radius = 6371.0088
+    d = distance_km / radius
+    p, b = math.radians(lat), math.radians(bearing)
+    lat2 = math.asin(math.sin(p) * math.cos(d) + math.cos(p) * math.sin(d) * math.cos(b))
+    lon2 = math.radians(lon) + math.atan2(
+        math.sin(b) * math.sin(d) * math.cos(p), math.cos(d) - math.sin(p) * math.sin(lat2)
+    )
+    return math.degrees(lat2), ((math.degrees(lon2) + 540) % 360) - 180
+
+
 def require_role(role: str, allowed: set[str], action: str) -> None:
     if role not in allowed:
         raise DomainError("角色无权执行：%s" % action, 403)
@@ -161,10 +173,66 @@ class MaritimeSARService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS sectors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area_id INTEGER NOT NULL REFERENCES search_areas(id),
+                    seq INTEGER NOT NULL,
+                    bearing_start REAL NOT NULL,
+                    bearing_end REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    assigned_asset_id INTEGER REFERENCES assets(id),
+                    covered_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(area_id, seq)
+                );
+                CREATE TABLE IF NOT EXISTS coverage_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sector_id INTEGER NOT NULL REFERENCES sectors(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    client_report_id TEXT NOT NULL UNIQUE,
+                    reporter TEXT NOT NULL,
+                    distance_km REAL NOT NULL,
+                    sea_state_ok INTEGER NOT NULL,
+                    range_ok INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'applied',
+                    note TEXT NOT NULL DEFAULT '',
+                    recorded_at TEXT NOT NULL,
+                    applied_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS coverage_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area_id INTEGER NOT NULL REFERENCES search_areas(id),
+                    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    sector_id INTEGER NOT NULL REFERENCES sectors(id),
+                    coverage_report_id INTEGER REFERENCES coverage_reports(id),
+                    client_report_id TEXT,
+                    kind TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    reporter TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by TEXT NOT NULL DEFAULT ''
+                );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_sectors_area ON sectors(area_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_reviews_status ON coverage_reviews(status, id);
                 """
             )
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(search_areas)").fetchall()}
+        for column, ddl in (
+            ("sector_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("covered_sector_count", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in cols:
+                conn.execute("ALTER TABLE search_areas ADD COLUMN %s %s" % (column, ddl))
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -289,6 +357,299 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "area.created", {"area_id": cur.lastrowid, "code": code})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def list_sectors(self, area_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM sectors WHERE area_id=? ORDER BY seq", (area_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_reviews(self, status: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM coverage_reviews"
+        params: tuple[Any, ...] = ()
+        if status:
+            sql += " WHERE status=?"
+            params = (status,)
+        with self.connect() as conn:
+            rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def split_area(self, actor: str, role: str, area_id: int, sector_count: int) -> dict[str, Any]:
+        """把搜索区域拆成沿圆周首尾相接的连续扇区；重复拆分仅在数量一致时幂等返回。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "拆分搜索扇区")
+        try:
+            sector_count = int(sector_count)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("扇区数量必须是整数") from exc
+        if not 1 <= sector_count <= 72:
+            raise DomainError("扇区数量应在 1 到 72 之间")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            existing = conn.execute("SELECT COUNT(*) AS c FROM sectors WHERE area_id=?", (area_id,)).fetchone()["c"]
+            if existing:
+                if existing != sector_count:
+                    raise DomainError("搜索区域已拆分为 %d 个扇区，不能重新拆分" % existing, 409)
+                sectors = [dict(r) for r in conn.execute("SELECT * FROM sectors WHERE area_id=? ORDER BY seq", (area_id,))]
+                return {"area_id": area_id, "sector_count": len(sectors), "sectors": sectors, "idempotent": True}
+            width = 360.0 / sector_count
+            for seq in range(sector_count):
+                bearing_start = round(seq * width, 4)
+                bearing_end = round((seq + 1) * width, 4)
+                conn.execute(
+                    """INSERT INTO sectors(area_id,seq,bearing_start,bearing_end,status,created_at,updated_at)
+                       VALUES(?,?,?,?, 'pending',?,?)""",
+                    (area_id, seq + 1, bearing_start, bearing_end, now, now),
+                )
+            conn.execute(
+                "UPDATE search_areas SET sector_count=?,updated_at=? WHERE id=?",
+                (sector_count, now, area_id),
+            )
+            self._audit(conn, area["incident_id"], actor, "sectors.split", {"area_id": area_id, "sector_count": sector_count})
+            sectors = [dict(r) for r in conn.execute("SELECT * FROM sectors WHERE area_id=? ORDER BY seq", (area_id,))]
+            return {"area_id": area_id, "sector_count": sector_count, "sectors": sectors, "idempotent": False}
+
+    def _coverage_eligibility(self, conn: sqlite3.Connection, area: sqlite3.Row,
+                              asset: sqlite3.Row, sector: sqlite3.Row) -> tuple[bool, bool, float, float]:
+        """返回 (海况合格, 航程合格, 到扇区中点距离, 当时海况)；海况以扇区上报时的区域/事件为准。"""
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+        sea_state = incident["sea_state"] if incident else 0
+        midpoint = (sector["bearing_start"] + sector["bearing_end"]) / 2
+        slat, slon = destination_point(area["center_lat"], area["center_lon"], midpoint, area["radius_km"])
+        distance = haversine_km(asset["latitude"], asset["longitude"], slat, slon)
+        sea_ok = sea_state <= asset["max_sea_state"]
+        range_ok = distance <= asset["range_km"]
+        return sea_ok, range_ok, distance, sea_state
+
+    def submit_coverage(self, actor: str, role: str, sector_id: int, asset_id: int,
+                        client_report_id: str, note: str = "") -> dict[str, Any]:
+        """资源上报覆盖扇区：按 client_report_id 去重；海况/航程不合格只进待核清单，不改变覆盖。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator", "field"}, "上报扇区覆盖")
+        report_id = client_report_id.strip()
+        if not report_id:
+            raise DomainError("客户端上报编号不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM coverage_reports WHERE client_report_id=?", (report_id,)).fetchone()
+            if existing:
+                return {"report": dict(existing), "idempotent": True, "review": None}
+            sector = conn.execute("SELECT * FROM sectors WHERE id=?", (sector_id,)).fetchone()
+            asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if not sector or not asset:
+                raise DomainError("扇区或资源不存在", 404)
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (sector["area_id"],)).fetchone()
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+            sea_ok, range_ok, distance, sea_state = self._coverage_eligibility(conn, area, asset, sector)
+            now = utcnow()
+            if not (sea_ok and range_ok):
+                cur = conn.execute(
+                    """INSERT INTO coverage_reports(sector_id,asset_id,client_report_id,reporter,distance_km,
+                       sea_state_ok,range_ok,status,note,recorded_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (sector_id, asset_id, report_id, actor, round(distance, 3), int(sea_ok), int(range_ok),
+                     "ineligible", note.strip(), now),
+                )
+                reason = "sea_state" if not sea_ok else "range"
+                conn.execute(
+                    """INSERT INTO coverage_reviews(area_id,incident_id,sector_id,coverage_report_id,client_report_id,
+                       kind,reason,details,status,reporter,created_at)
+                       VALUES(?,?,?,?,?, 'ineligible',?,?, 'pending',?,?)""",
+                    (area["id"], area["incident_id"], sector_id, cur.lastrowid, report_id, reason,
+                     json_dump({"distance_km": round(distance, 3), "sea_state": sea_state,
+                                "asset_max_sea_state": asset["max_sea_state"], "range_km": asset["range_km"]}),
+                     actor, now),
+                )
+                self._audit(conn, area["incident_id"], actor, "coverage.flagged",
+                            {"sector_id": sector_id, "asset_id": asset_id, "reason": reason, "report_id": report_id})
+                report = dict(conn.execute("SELECT * FROM coverage_reports WHERE id=?", (cur.lastrowid,)).fetchone())
+                return {"report": report, "idempotent": False, "applied": False, "review_reason": reason}
+            cur = conn.execute(
+                """INSERT INTO coverage_reports(sector_id,asset_id,client_report_id,reporter,distance_km,
+                   sea_state_ok,range_ok,status,note,recorded_at,applied_at)
+                   VALUES(?,?,?,?,?,?,?, 'applied',?,?,?)""",
+                (sector_id, asset_id, report_id, actor, round(distance, 3), 1, 1, note.strip(), now, now),
+            )
+            already_covered = sector["status"] == "covered"
+            if not already_covered:
+                conn.execute(
+                    "UPDATE sectors SET status='covered',covered_at=?,version=version+1,updated_at=? WHERE id=?",
+                    (now, now, sector_id),
+                )
+                conn.execute(
+                    "UPDATE search_areas SET covered_sector_count=covered_sector_count+1,updated_at=? WHERE id=?",
+                    (now, area["id"]),
+                )
+            self._audit(conn, area["incident_id"], actor, "coverage.applied",
+                        {"sector_id": sector_id, "asset_id": asset_id, "already_covered": already_covered,
+                         "report_id": report_id})
+            report = dict(conn.execute("SELECT * FROM coverage_reports WHERE id=?", (cur.lastrowid,)).fetchone())
+            return {"report": report, "idempotent": False, "applied": not already_covered}
+
+    def reassign_sector(self, actor: str, role: str, sector_id: int, asset_id: int,
+                        expected_sector_version: int) -> dict[str, Any]:
+        """改派扇区；两个协调员并发改派时，乐观版本条件保证只有一人成功。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "改派搜索扇区")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sector = conn.execute("SELECT * FROM sectors WHERE id=?", (sector_id,)).fetchone()
+            asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if not sector or not asset:
+                raise DomainError("扇区或资源不存在", 404)
+            if sector["version"] != int(expected_sector_version):
+                raise DomainError("扇区已被其他协调员改派，请刷新后重试", 409)
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (sector["area_id"],)).fetchone()
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+            if not incident or incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("事件当前不可改派", 409)
+            if area["status"] in {"completed", "abandoned"}:
+                raise DomainError("已结束区域不能改派", 409)
+            if sector["status"] == "covered":
+                raise DomainError("已覆盖扇区无需改派", 409)
+            if asset["status"] != "available":
+                raise DomainError("资源当前不可用", 409)
+            if incident["sea_state"] > asset["max_sea_state"]:
+                raise DomainError("海况超出资源能力", 409)
+            midpoint = (sector["bearing_start"] + sector["bearing_end"]) / 2
+            slat, slon = destination_point(area["center_lat"], area["center_lon"], midpoint, area["radius_km"])
+            distance = haversine_km(asset["latitude"], asset["longitude"], slat, slon)
+            if distance > asset["range_km"]:
+                raise DomainError("扇区超出资源航程", 409)
+            now = utcnow()
+            changed = conn.execute(
+                "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=? AND status='available'",
+                (now, asset_id),
+            )
+            if changed.rowcount != 1:
+                raise DomainError("资源已被其他任务占用", 409)
+            previous_asset = sector["assigned_asset_id"]
+            if previous_asset is not None:
+                conn.execute(
+                    "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                    (now, previous_asset),
+                )
+            changed = conn.execute(
+                """UPDATE sectors SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=?
+                   WHERE id=? AND version=?""",
+                (asset_id, now, sector_id, expected_sector_version),
+            )
+            if changed.rowcount != 1:
+                raise DomainError("扇区已被其他协调员改派，请刷新后重试", 409)
+            if area["assigned_asset_id"] is None:
+                conn.execute(
+                    "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
+                    (asset_id, now, area["id"]),
+                )
+            self._audit(conn, area["incident_id"], actor, "sector.reassigned",
+                        {"sector_id": sector_id, "asset_id": asset_id, "previous_asset_id": previous_asset})
+            return dict(conn.execute("SELECT * FROM sectors WHERE id=?", (sector_id,)).fetchone())
+
+    def resolve_coverage_review(self, actor: str, role: str, review_id: int, approve: bool,
+                                note: str = "") -> dict[str, Any]:
+        """协调员处理待核清单：批准则补记覆盖；区域已结束时批准仍记为冲突，留待复核。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "处理待核清单")
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            review = conn.execute("SELECT * FROM coverage_reviews WHERE id=?", (review_id,)).fetchone()
+            if not review:
+                raise DomainError("待核项不存在", 404)
+            if review["status"] != "pending":
+                raise DomainError("待核项已处理", 409)
+            sector = conn.execute("SELECT * FROM sectors WHERE id=?", (review["sector_id"],)).fetchone()
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (review["area_id"],)).fetchone()
+            if not approve:
+                conn.execute(
+                    "UPDATE coverage_reviews SET status='rejected',resolved_at=?,resolved_by=? WHERE id=?",
+                    (now, actor, review_id),
+                )
+                if review["coverage_report_id"] is not None:
+                    conn.execute("UPDATE coverage_reports SET status='rejected' WHERE id=?",
+                                 (review["coverage_report_id"],))
+                self._audit(conn, review["incident_id"], actor, "coverage.review_rejected",
+                            {"review_id": review_id, "note": note.strip()})
+                return dict(conn.execute("SELECT * FROM coverage_reviews WHERE id=?", (review_id,)).fetchone())
+            if area["status"] in {"completed", "abandoned"}:
+                conn.execute(
+                    "UPDATE coverage_reviews SET status='conflict',resolved_at=?,resolved_by=?,details=? WHERE id=?",
+                    (now, actor, note.strip(), review_id),
+                )
+                self._audit(conn, review["incident_id"], actor, "coverage.review_conflict",
+                            {"review_id": review_id, "area_id": area["id"]})
+                return dict(conn.execute("SELECT * FROM coverage_reviews WHERE id=?", (review_id,)).fetchone())
+            if review["coverage_report_id"] is not None:
+                conn.execute("UPDATE coverage_reports SET status='applied',applied_at=? WHERE id=?",
+                             (now, review["coverage_report_id"]))
+            if sector and sector["status"] != "covered":
+                conn.execute(
+                    "UPDATE sectors SET status='covered',covered_at=?,version=version+1,updated_at=? WHERE id=?",
+                    (now, now, review["sector_id"]),
+                )
+                conn.execute(
+                    "UPDATE search_areas SET covered_sector_count=covered_sector_count+1,updated_at=? WHERE id=?",
+                    (now, review["area_id"]),
+                )
+            conn.execute(
+                "UPDATE coverage_reviews SET status='approved',resolved_at=?,resolved_by=?,details=? WHERE id=?",
+                (now, actor, note.strip(), review_id),
+            )
+            self._audit(conn, review["incident_id"], actor, "coverage.review_approved",
+                        {"review_id": review_id, "sector_id": review["sector_id"]})
+            return dict(conn.execute("SELECT * FROM coverage_reviews WHERE id=?", (review_id,)).fetchone())
+
+    def _recompute_area_coverage(self, conn: sqlite3.Connection, area_id: int, actor: str) -> dict[str, Any]:
+        """离线恢复后重算区域覆盖：活动区域直接修正，已结束区域的差异全部进冲突待核清单。"""
+        area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+        if not area:
+            return {"area_id": area_id, "conflicts": 0}
+        now = utcnow()
+        closed = area["status"] in {"completed", "abandoned"}
+        conflicts = 0
+        fixed = 0
+        sectors = conn.execute("SELECT * FROM sectors WHERE area_id=? ORDER BY seq", (area_id,)).fetchall()
+        for sector in sectors:
+            applied = conn.execute(
+                "SELECT COUNT(*) AS c FROM coverage_reports WHERE sector_id=? AND status='applied'",
+                (sector["id"],),
+            ).fetchone()["c"]
+            should_cover = applied > 0
+            if should_cover == (sector["status"] == "covered"):
+                continue
+            if closed:
+                conn.execute(
+                    """INSERT INTO coverage_reviews(area_id,incident_id,sector_id,coverage_report_id,client_report_id,
+                       kind,reason,details,status,reporter,created_at)
+                       VALUES(?,?,?,NULL,NULL, 'conflict', 'recompute',?, 'conflict',?,?)""",
+                    (area_id, area["incident_id"], sector["id"],
+                     json_dump({"recorded": sector["status"] == "covered", "expected": should_cover}), actor, now),
+                )
+                conflicts += 1
+            else:
+                if should_cover:
+                    conn.execute(
+                        "UPDATE sectors SET status='covered',covered_at=COALESCE(covered_at,?),version=version+1,updated_at=? WHERE id=?",
+                        (now, now, sector["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE sectors SET status='pending',covered_at=NULL,version=version+1,updated_at=? WHERE id=?",
+                        (now, sector["id"]),
+                    )
+                fixed += 1
+        if not closed:
+            covered = conn.execute(
+                "SELECT COUNT(*) AS c FROM sectors WHERE area_id=? AND status='covered'", (area_id,)
+            ).fetchone()["c"]
+            conn.execute("UPDATE search_areas SET covered_sector_count=?,updated_at=? WHERE id=?", (covered, now, area_id))
+        if conflicts:
+            self._audit(conn, area["incident_id"], actor, "coverage.recompute_conflict",
+                        {"area_id": area_id, "conflicts": conflicts})
+        return {"area_id": area_id, "conflicts": conflicts, "fixed": fixed}
+
     def assign_area(self, actor: str, role: str, area_id: int, asset_id: int,
                     expected_asset_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -407,6 +768,13 @@ class MaritimeSARService:
             for area in areas:
                 conn.execute("UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?", (now, area["id"]))
                 self._audit(conn, area["incident_id"], actor, "area.unassigned", {"area_id": area["id"], "reason": reason.strip()})
+            sector_rows = conn.execute(
+                "SELECT s.id,s.area_id,a.incident_id FROM sectors s JOIN search_areas a ON a.id=s.area_id WHERE s.assigned_asset_id=?",
+                (asset_id,),
+            ).fetchall()
+            for sector_row in sector_rows:
+                conn.execute("UPDATE sectors SET assigned_asset_id=NULL,status='pending',version=version+1,updated_at=? WHERE id=?", (now, sector_row["id"]))
+                self._audit(conn, sector_row["incident_id"], actor, "sector.unassigned", {"sector_id": sector_row["id"], "reason": reason.strip()})
             conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, asset_id))
             self._audit(conn, None, actor, "asset.withdrawn", {"asset_id": asset_id, "reason": reason.strip()})
             return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
@@ -451,8 +819,14 @@ class MaritimeSARService:
                 raise DomainError("搜索区域已变化，请刷新后重试", 409)
             if area["assigned_asset_id"] is not None:
                 conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (utcnow(), area["assigned_asset_id"]))
+            conn.execute(
+                "UPDATE sectors SET assigned_asset_id=NULL,version=version+1,updated_at=? WHERE area_id=? AND assigned_asset_id IS NOT NULL",
+                (utcnow(), area_id),
+            )
             conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, utcnow(), area_id))
-            self._audit(conn, area["incident_id"], actor, "area." + outcome, {"area_id": area_id})
+            recompute = self._recompute_area_coverage(conn, area_id, actor)
+            self._audit(conn, area["incident_id"], actor, "area." + outcome,
+                        {"area_id": area_id, "coverage_conflicts": recompute["conflicts"]})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
     def close_incident(self, actor: str, role: str, incident_id: int, outcome: str,
@@ -492,12 +866,109 @@ class MaritimeSARService:
             if existing:
                 return {"batch_id": batch_id, "idempotent": True, "status": existing["status"], "summary": json.loads(existing["summary"])}
             results = []
+            touched_areas: set[int] = set()
+            event_conflicts = 0
             for event in events:
                 event_id = str(event.get("client_event_id", "")).strip()
                 try:
                     if not event_id:
                         raise DomainError("离线事件缺少 client_event_id")
-                    if event.get("type") == "clue":
+                    if event.get("type") == "sector_split":
+                        area_id = int(event["area_id"])
+                        area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+                        if not area:
+                            raise DomainError("搜索区域不存在", 404)
+                        count = int(event.get("sector_count", 0))
+                        if not 1 <= count <= 72:
+                            raise DomainError("扇区数量应在 1 到 72 之间")
+                        already = conn.execute("SELECT COUNT(*) AS c FROM sectors WHERE area_id=?", (area_id,)).fetchone()["c"]
+                        if already:
+                            if already != count:
+                                raise DomainError("区域已拆分为 %d 个扇区，数量冲突" % already, 409)
+                            results.append({"client_event_id": event_id, "status": "merged", "record_id": area_id, "idempotent": True})
+                        else:
+                            now = utcnow()
+                            width = 360.0 / count
+                            for seq in range(count):
+                                conn.execute(
+                                    """INSERT INTO sectors(area_id,seq,bearing_start,bearing_end,status,created_at,updated_at)
+                                       VALUES(?,?,?,?, 'pending',?,?)""",
+                                    (area_id, seq + 1, round(seq * width, 4), round((seq + 1) * width, 4), now, now),
+                                )
+                            conn.execute("UPDATE search_areas SET sector_count=?,updated_at=? WHERE id=?", (count, now, area_id))
+                            self._audit(conn, area["incident_id"], actor, "sectors.split",
+                                        {"area_id": area_id, "sector_count": count, "offline": True})
+                            results.append({"client_event_id": event_id, "status": "merged", "record_id": area_id})
+                        touched_areas.add(area_id)
+                    elif event.get("type") == "coverage":
+                        sector_id, asset_id = int(event["sector_id"]), int(event["asset_id"])
+                        duplicated = conn.execute(
+                            "SELECT id,status FROM coverage_reports WHERE client_report_id=?", (event_id,)
+                        ).fetchone()
+                        if duplicated:
+                            touched = conn.execute("SELECT area_id FROM sectors WHERE id=?", (sector_id,)).fetchone()
+                            if touched:
+                                touched_areas.add(touched["area_id"])
+                            results.append({"client_event_id": event_id, "status": "merged",
+                                            "record_id": duplicated["id"], "idempotent": True})
+                            continue
+                        sector = conn.execute("SELECT * FROM sectors WHERE id=?", (sector_id,)).fetchone()
+                        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+                        if not sector or not asset:
+                            raise DomainError("扇区或资源不存在", 404)
+                        area = conn.execute("SELECT * FROM search_areas WHERE id=?", (sector["area_id"],)).fetchone()
+                        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+                        if not incident:
+                            raise DomainError("事件不存在", 404)
+                        sea_ok, range_ok, distance, sea_state = self._coverage_eligibility(conn, area, asset, sector)
+                        now = utcnow()
+                        area_closed = area["status"] in {"completed", "abandoned"} or incident["status"] in CLOSED_INCIDENT
+                        if not (sea_ok and range_ok):
+                            report_status = "ineligible"
+                            kind, reason = "ineligible", ("sea_state" if not sea_ok else "range")
+                        elif area_closed:
+                            report_status = "conflict"
+                            kind, reason = "conflict", "area_closed"
+                        else:
+                            report_status, kind, reason = "applied", "", ""
+                        cur = conn.execute(
+                            """INSERT INTO coverage_reports(sector_id,asset_id,client_report_id,reporter,distance_km,
+                               sea_state_ok,range_ok,status,note,recorded_at,applied_at)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                            (sector_id, asset_id, event_id, actor, round(distance, 3), int(sea_ok), int(range_ok),
+                             report_status, str(event.get("note", "")).strip(), now, now if report_status == "applied" else None),
+                        )
+                        if kind:
+                            conn.execute(
+                                """INSERT INTO coverage_reviews(area_id,incident_id,sector_id,coverage_report_id,
+                                   client_report_id,kind,reason,details,status,reporter,created_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?, ?,?)""",
+                                (area["id"], area["incident_id"], sector_id, cur.lastrowid, event_id, kind, reason,
+                                 json_dump({"distance_km": round(distance, 3), "sea_state": sea_state,
+                                            "asset_max_sea_state": asset["max_sea_state"], "range_km": asset["range_km"],
+                                            "area_status": area["status"]}),
+                                 "pending", actor, now),
+                            )
+                            if kind == "conflict":
+                                event_conflicts += 1
+                            self._audit(conn, area["incident_id"], actor,
+                                        "coverage.conflict" if kind == "conflict" else "coverage.flagged",
+                                        {"sector_id": sector_id, "reason": reason, "report_id": event_id, "offline": True})
+                        elif sector["status"] != "covered":
+                            conn.execute(
+                                "UPDATE sectors SET status='covered',covered_at=?,version=version+1,updated_at=? WHERE id=?",
+                                (now, now, sector_id),
+                            )
+                            conn.execute(
+                                "UPDATE search_areas SET covered_sector_count=covered_sector_count+1,updated_at=? WHERE id=?",
+                                (now, area["id"]),
+                            )
+                            self._audit(conn, area["incident_id"], actor, "coverage.applied",
+                                        {"sector_id": sector_id, "asset_id": asset_id, "report_id": event_id, "offline": True})
+                        touched_areas.add(area["id"])
+                        results.append({"client_event_id": event_id, "status": "merged", "record_id": cur.lastrowid,
+                                        "coverage_status": report_status})
+                    elif event.get("type") == "clue":
                         existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
                         if existing_clue:
                             results.append({"client_event_id": event_id, "status": "merged", "record_id": existing_clue["id"], "idempotent": True})
@@ -539,7 +1010,9 @@ class MaritimeSARService:
                         raise DomainError("不支持的离线事件类型")
                 except (DomainError, KeyError, TypeError, ValueError) as exc:
                     results.append({"client_event_id": event_id, "status": "rejected", "error": str(exc)})
-            summary = {"accepted": sum(1 for item in results if item["status"] == "merged"), "rejected": sum(1 for item in results if item["status"] == "rejected"), "events": results}
+            recomputed = [self._recompute_area_coverage(conn, area_id, actor) for area_id in sorted(touched_areas)]
+            conflicts = sum(item["conflicts"] for item in recomputed) + event_conflicts
+            summary = {"accepted": sum(1 for item in results if item["status"] == "merged"), "rejected": sum(1 for item in results if item["status"] == "rejected"), "coverage_conflicts": conflicts, "recomputed": recomputed, "events": results}
             now = utcnow()
             conn.execute(
                 "INSERT INTO offline_batches(client_batch_id,actor,status,received_at,merged_at,summary) VALUES(?,?,?,?,?,?)",
@@ -554,8 +1027,13 @@ class MaritimeSARService:
             areas = [dict(r) for r in conn.execute("SELECT * FROM search_areas ORDER BY priority,id").fetchall()]
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+            sectors = [dict(r) for r in conn.execute("SELECT * FROM sectors ORDER BY area_id,seq").fetchall()]
+            coverage_reports = [dict(r) for r in conn.execute("SELECT * FROM coverage_reports ORDER BY id DESC LIMIT 500").fetchall()]
+            coverage_reviews = [dict(r) for r in conn.execute("SELECT * FROM coverage_reviews ORDER BY id DESC LIMIT 500").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "sectors": sectors, "coverage_reports": coverage_reports,
+                "coverage_reviews": coverage_reviews, "timeline": timeline}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -625,6 +1103,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
                 return
+            if path.startswith("/api/areas/") and path.endswith("/sectors"):
+                area_id = int(path.split("/")[3])
+                self._send(200, {"sectors": self.service.list_sectors(area_id)})
+                return
+            if path == "/api/coverage/reviews":
+                self._send(200, {"reviews": self.service.list_reviews()})
+                return
             self._send(404, {"error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._send(getattr(exc, "status", 400), {"error": str(exc)})
@@ -639,6 +1124,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.add_asset(actor, role, **data)
             elif path == "/api/areas":
                 result = self.service.create_search_area(actor, role, **data)
+            elif path == "/api/areas/split":
+                result = self.service.split_area(actor, role, **data)
+            elif path == "/api/coverage":
+                result = self.service.submit_coverage(actor, role, **data)
+            elif path == "/api/coverage/review":
+                result = self.service.resolve_coverage_review(actor, role, **data)
+            elif path == "/api/sectors/reassign":
+                result = self.service.reassign_sector(actor, role, **data)
             elif path == "/api/assignments":
                 result = self.service.assign_area(actor, role, **data)
             elif path == "/api/clues":
